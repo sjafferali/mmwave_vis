@@ -1,7 +1,16 @@
 # Changelog
 
 
-## [2.2.0] - 2025-02-18
+## [2.2.1] - 2025-03-06
+
+### Fixed
+- **Flask compatibility crash:** Fixed `AttributeError: property 'session' of 'RequestContext' object has no setter` that prevented devices from loading for some users. Caused by unpinned Flask dependency resolving to 3.2.x during Docker build, which removed the `RequestContext.session` setter that flask-socketio relies on. Users who installed or rebuilt the addon after Flask 3.2 was published would hit this on every WebSocket connection.
+
+### Changed
+- Pinned Flask to `>=3.1,<3.2` in `requirements.txt` to ensure consistent builds across all users regardless of install timing.
+- Added `manage_session=False` to the SocketIO constructor. The addon does not use Flask sessions, so this bypasses the session handling code path entirely as additional protection against future Flask version changes.
+
+## [2.2.0] - 2025-03-04
 
 ### Fixed
 - **Crash when `mmwave_detection_areas` is null ([#issue](https://github.com/nickduvall921/mmwave_vis/issues/15)):** Some switches report `mmwave_detection_areas: null` in their Z2M payload. The backend tried to call `.get("area1")` on `None`, crashing the entire message handler on every incoming message and preventing devices from appearing in the list.

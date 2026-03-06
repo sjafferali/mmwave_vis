@@ -39,7 +39,7 @@ except FileNotFoundError:
     MQTT_BASE_TOPIC = 'zigbee2mqtt'
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', manage_session=False)
 
 # --- FIX #1: Per-session device tracking instead of global current_topic ---
 # Maps socket session ID -> device topic
