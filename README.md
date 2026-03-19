@@ -1,4 +1,4 @@
-# Inovelli mmWave Visualizer for Z2M
+# Inovelli mmWave Visualizer for Z2M and ZHA(Experimental)
 
 **Live 2D presence tracking and zone configuration for Inovelli mmWave Smart Switches in Home Assistant.**
 
@@ -13,6 +13,9 @@
 ## Overview
 
 Decodes Zigbee2MQTT payloads to visualize real-time MQTT data and configure detection, interference, and stay zones via MQTT commands. The radar overlay reflects the sensors actual field of view (120°–150°) with range arcs at 1m intervals up to 6m.
+
+ZHA support has just been added experimentally. Requires a custom Quark that I have built to be installed in ZHA.
+[ZHA DOC HERE](ZHADOC.md)
 
 ## Features
 
@@ -42,7 +45,7 @@ Click the button below to add this repository to your Home Assistant instance:
    ```
 5. Close the dialog. **Inovelli mmWave Visualizer** will appear at the bottom of the Add-on Store.
 
-## Configuration
+## Configuration(Z2M)
 
 Before starting the add-on, go to the **Configuration** tab and connect it to your MQTT broker.
 
@@ -56,7 +59,7 @@ Before starting the add-on, go to the **Configuration** tab and connect it to yo
 
 > **Note:** If you use the standard Home Assistant Mosquitto broker add-on, the defaults should work out of the box.
 
-## Switch Setup (Required)
+## Switch Setup (Required)(Z2M)
 
 1. Go to your switch's device page in Zigbee2MQTT → **Bind** tab.
 2. In the **Clusters** dropdown, add `manuSpecificInovelliMMWave`.

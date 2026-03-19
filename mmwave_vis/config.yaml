@@ -1,6 +1,6 @@
 name: "Inovelli mmWave Visualizer"
-description: "Live 2D tracking for Inovelli mmWave switches via MQTT-Z2M"
-version: "2.2.1"
+description: "Live 2D tracking for Inovelli mmWave switches via MQTT-Z2M or ZHA"
+version: "3.0.0"
 slug: "mmwave_viz"
 init: false
 arch:
@@ -8,22 +8,31 @@ arch:
   - amd64
 map:
   - config:rw
+hassio_api: true
+hassio_role: default
+homeassistant_api: true
 options:
+  zigbee_stack: "z2m"
+  debug: false
   mqtt_broker: "core-mosquitto"
   mqtt_port: 1883
   mqtt_username: ""
   mqtt_password: ""
   mqtt_base_topic: "zigbee2mqtt"
+  ha_url: "http://supervisor"
+  ha_token: ""
 schema:
+  zigbee_stack: str
+  debug: bool
   mqtt_broker: str
   mqtt_port: int
   mqtt_username: str
   mqtt_password: str
   mqtt_base_topic: str
+  ha_url: str
+  ha_token: str
 
 ingress: true
 ingress_port: 5000
 panel_icon: mdi:radar
 panel_title: "mmWave Radar"
-
-

@@ -1,7 +1,21 @@
 """
-Inovelli mmWave Visualizer Backend
-Provides a real-time MQTT-to-WebSocket bridge for Home Assistant Ingress.
-Handles device discovery, Zigbee byte array decoding, and two-way configuration.
+Inovelli mmWave Visualizer — Backend
+=====================================
+Real-time MQTT/ZHA-to-WebSocket bridge for Home Assistant Ingress.
+
+Supports two Zigbee stacks, selected via the addon Configuration tab:
+  zigbee_stack: "z2m"  — Zigbee2MQTT over MQTT (original behaviour)
+  zigbee_stack: "zha"  — ZHA via the Home Assistant WebSocket API
+
+All socket.io event handlers are stack-agnostic — they delegate to a
+driver object (Z2MDriver or ZHADriver) that implements a common interface.
+The frontend receives identical events regardless of which stack is active.
+
+Debug mode (debug: true in config):
+  Logs every socket.io emit and, for ZHA, every raw WebSocket message
+  received from HA. Useful for verifying data flow when troubleshooting
+  a new installation. Safe to leave enabled — output is truncated at
+  300–400 chars per message.
 """
 
 import json
@@ -11,51 +25,82 @@ import time
 import threading
 from flask import Flask, render_template, request
 from flask_socketio import SocketIO, emit
-from flask_socketio import join_room, leave_room
 import paho.mqtt.client as mqtt
 import logging
 
-# Suppress the Werkzeug development server warning
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
+# Suppress Werkzeug's development-server banner — not useful in an addon
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-# --- LOAD HOME ASSISTANT CONFIGURATION ---
+# ---------------------------------------------------------------------------
+# Load Home Assistant addon configuration
+# ---------------------------------------------------------------------------
 CONFIG_PATH = '/data/options.json'
 
 try:
     with open(CONFIG_PATH) as f:
         config = json.load(f)
-        MQTT_BROKER = config.get('mqtt_broker', 'core-mosquitto')
-        MQTT_PORT = int(config.get('mqtt_port', 1883))
-        MQTT_USERNAME = config.get('mqtt_username', '')
-        MQTT_PASSWORD = config.get('mqtt_password', '')
-        MQTT_BASE_TOPIC = config.get('mqtt_base_topic', 'zigbee2mqtt')
 except FileNotFoundError:
-    print("No options.json found. Using defaults.", flush=True)
-    MQTT_BROKER = 'core-mosquitto'
-    MQTT_PORT = 1883
-    MQTT_USERNAME = ''
-    MQTT_PASSWORD = ''
-    MQTT_BASE_TOPIC = 'zigbee2mqtt'
+    print("No options.json found — using built-in defaults.", flush=True)
+    config = {}
 
+ZIGBEE_STACK    = config.get('zigbee_stack', 'z2m').lower().strip()
+DEBUG           = bool(config.get('debug', False))
+MQTT_BROKER     = config.get('mqtt_broker', 'core-mosquitto')
+MQTT_PORT       = int(config.get('mqtt_port', 1883))
+MQTT_USERNAME   = config.get('mqtt_username', '')
+MQTT_PASSWORD   = config.get('mqtt_password', '')
+MQTT_BASE_TOPIC = config.get('mqtt_base_topic', 'zigbee2mqtt')
+HA_URL          = config.get('ha_url', 'http://supervisor')
+
+# SUPERVISOR_TOKEN is auto-injected by HA when homeassistant_api: true is set
+# in config.yaml. The ha_token config field is a manual fallback — generate a
+# long-lived access token from your HA profile page if needed.
+_supervisor_token = os.environ.get('SUPERVISOR_TOKEN', '')
+_config_token     = config.get('ha_token', '')
+HA_TOKEN          = _supervisor_token or _config_token
+
+# ---------------------------------------------------------------------------
+# Startup diagnostics
+# ---------------------------------------------------------------------------
+print(f"Zigbee stack : {ZIGBEE_STACK}", flush=True)
+print(f"Debug mode   : {'ON' if DEBUG else 'OFF'}", flush=True)
+
+if ZIGBEE_STACK == 'zha':
+    print(f"ZHA ha_url   : {HA_URL}", flush=True)
+    if _supervisor_token:
+        if DEBUG:
+            print(f"ZHA token    : SUPERVISOR_TOKEN (len={len(_supervisor_token)}, "
+                  f"first6={_supervisor_token[:6]}, last6={_supervisor_token[-6:]})", flush=True)
+        else:
+            print(f"ZHA token    : SUPERVISOR_TOKEN (len={len(_supervisor_token)})", flush=True)
+    elif _config_token:
+        print(f"ZHA token    : ha_token from config (len={len(_config_token)})", flush=True)
+    else:
+        print(
+            "ZHA WARNING  : No token found.\n"
+            "               Ensure homeassistant_api: true is set in config.yaml\n"
+            "               and the addon has been fully stopped and restarted.\n"
+            "               Alternatively, set ha_token in the addon Configuration\n"
+            "               tab using a long-lived access token from your HA profile.",
+            flush=True
+        )
+
+# ---------------------------------------------------------------------------
+# Flask + Socket.IO
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', manage_session=False)
 
-# --- FIX #1: Per-session device tracking instead of global current_topic ---
-# Maps socket session ID -> device topic
-session_topics = {}
+# ---------------------------------------------------------------------------
+# Per-session device tracking  (socket session id → device topic/key)
+# ---------------------------------------------------------------------------
+session_topics      = {}
 session_topics_lock = threading.Lock()
 
-# --- FIX #3: Thread-safe device list with lock ---
-device_list = {}
-device_list_lock = threading.Lock()
-
-# --- FIX #6: Track MQTT connection state ---
-mqtt_connected = False
-
-# --- FIX #10: Parameter validation whitelist ---
+# ---------------------------------------------------------------------------
+# Parameter validation whitelist  (shared by both stacks)
+# ---------------------------------------------------------------------------
 VALID_PARAMETERS = {
-    # String-value parameters (value must match one of the allowed options)
     'mmWaveDetectSensitivity': {
         'type': 'enum',
         'options': ['Low', 'Medium', 'High (default)']
@@ -80,30 +125,26 @@ VALID_PARAMETERS = {
             'Mirrored Vacancy', 'Mirrored Wasteful Occupancy'
         ]
     },
-    # Numeric parameters
-    'mmWaveHoldTime': {'type': 'int', 'min': 0, 'max': 28800},
-    'mmWaveStayLife': {'type': 'int', 'min': 0, 'max': 28800},
-    # Zone composite parameters (validated structurally)
-    'mmwave_detection_areas': {'type': 'zone_composite'},
+    'mmWaveHoldTime':  {'type': 'int', 'min': 0, 'max': 28800},
+    'mmWaveStayLife':  {'type': 'int', 'min': 0, 'max': 28800},
+    'mmwave_detection_areas':    {'type': 'zone_composite'},
     'mmwave_interference_areas': {'type': 'zone_composite'},
-    'mmwave_stay_areas': {'type': 'zone_composite'},
+    'mmwave_stay_areas':         {'type': 'zone_composite'},
 }
 
-# Valid keys inside a zone area payload
-VALID_ZONE_KEYS = {'width_min', 'width_max', 'depth_min', 'depth_max', 'height_min', 'height_max'}
-ZONE_COORD_RANGE = (-10000, 10000)  # Reasonable cm range
+VALID_ZONE_KEYS  = {'width_min', 'width_max', 'depth_min', 'depth_max', 'height_min', 'height_max'}
+ZONE_COORD_RANGE = (-10000, 10000)
 
 
 def validate_parameter(param, value):
-    """
-    Validate a parameter name and value against the whitelist.
-    Returns (is_valid: bool, error_message: str or None).
+    """Validate a parameter name and value against the whitelist.
+    Returns (is_valid: bool, error_message: str | None).
     """
     if param not in VALID_PARAMETERS:
         return False, f"Unknown parameter: {param}"
 
     schema = VALID_PARAMETERS[param]
-    ptype = schema['type']
+    ptype  = schema['type']
 
     if ptype == 'enum':
         if not isinstance(value, str) or value not in schema['options']:
@@ -125,13 +166,12 @@ def validate_parameter(param, value):
         for area_key, area_val in value.items():
             if not area_key.startswith('area') or not area_key[4:].isdigit():
                 return False, f"Invalid area key: {area_key}"
-            area_num = int(area_key[4:])
-            if area_num < 1 or area_num > 4:
+            if int(area_key[4:]) < 1 or int(area_key[4:]) > 4:
                 return False, f"Area number out of range: {area_key}"
             if not isinstance(area_val, dict):
                 return False, f"Area {area_key} value must be a dict"
-            if not set(area_val.keys()).issubset(VALID_ZONE_KEYS):
-                unknown = set(area_val.keys()) - VALID_ZONE_KEYS
+            unknown = set(area_val.keys()) - VALID_ZONE_KEYS
+            if unknown:
                 return False, f"Unknown zone keys in {area_key}: {unknown}"
             for coord_key, coord_val in area_val.items():
                 try:
@@ -146,7 +186,7 @@ def validate_parameter(param, value):
 
 
 def safe_int(value, default=0):
-    """Safely converts a value to int."""
+    """Safely convert a value to int, returning default on failure."""
     try:
         if value is None or value == "":
             return default
@@ -155,529 +195,610 @@ def safe_int(value, default=0):
         return default
 
 
-# --- FIX #2: Parse bytes as a module-level function, not redefined inside loops ---
-def parse_signed_16(payload, idx):
-    """Parse a signed 16-bit little-endian value from two consecutive payload bytes."""
-    try:
-        low = int(payload.get(str(idx)) or 0)
-        high = int(payload.get(str(idx + 1)) or 0)
-        return int.from_bytes([low, high], byteorder='little', signed=True)
-    except (ValueError, TypeError, OverflowError):
-        return 0
-
-
-def get_device_list_snapshot():
-    """Return a thread-safe copy of the device list for emitting."""
-    with device_list_lock:
-        return [dict(d) for d in device_list.values()]
-
+# ---------------------------------------------------------------------------
+# Helpers shared by both stacks
+# ---------------------------------------------------------------------------
 
 def get_sessions_for_topic(topic):
-    """Return list of session IDs currently monitoring a given topic."""
     with session_topics_lock:
         return [sid for sid, t in session_topics.items() if t == topic]
 
 
 def emit_to_topic_subscribers(event, data, topic):
-    """Emit an event only to sessions monitoring the given device topic."""
-    sids = get_sessions_for_topic(topic)
-    for sid in sids:
+    """Emit a socket.io event to all sessions currently watching a given device."""
+    for sid in get_sessions_for_topic(topic):
         socketio.emit(event, data, to=sid)
 
 
-# --- MQTT CALLBACKS ---
+# ===========================================================================
+# Z2M DRIVER
+# Wraps the original paho-MQTT logic. Exposes the same interface as ZHADriver
+# so the socket.io handlers below need no stack-awareness.
+# ===========================================================================
 
-def on_connect(client, userdata, flags, rc):
-    global mqtt_connected
-    if rc == 0:
-        mqtt_connected = True
-        print(f"Connected to MQTT Broker", flush=True)
-        client.subscribe(f"{MQTT_BASE_TOPIC}/#")
-        # Broadcast connection state to all clients
-        socketio.emit('mqtt_status', {'connected': True})
-    else:
-        mqtt_connected = False
-        print(f"MQTT connection failed with code {rc}", flush=True)
-        socketio.emit('mqtt_status', {'connected': False, 'error': f'Connection code: {rc}'})
+class Z2MDriver:
 
+    def __init__(self):
+        self.device_list      = {}
+        self.device_list_lock = threading.Lock()
+        self.mqtt_connected   = False
 
-def on_disconnect(client, userdata, rc):
-    global mqtt_connected
-    mqtt_connected = False
-    print(f"Disconnected from MQTT Broker (rc={rc})", flush=True)
-    socketio.emit('mqtt_status', {'connected': False, 'error': 'Broker disconnected'})
+        self._client = mqtt.Client()
+        if MQTT_USERNAME and MQTT_PASSWORD:
+            self._client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        self._client.on_connect    = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
+        self._client.on_message    = self._on_message
 
+    # --- Lifecycle ---
 
-def on_message(client, userdata, msg):
-    try:
-        topic = msg.topic
-        payload_str = msg.payload.decode().strip()
+    def start(self):
+        try:
+            self._client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            self._client.loop_start()
+        except Exception as e:
+            print(f"MQTT Connection Failed: {e}", flush=True)
 
-        if not payload_str:
+        threading.Thread(target=self._cleanup_loop, daemon=True).start()
+
+    # --- Public interface ---
+
+    def get_device_list_snapshot(self):
+        with self.device_list_lock:
+            return [dict(d) for d in self.device_list.values()]
+
+    def set_device(self, sid, new_topic):
+        with session_topics_lock:
+            session_topics[sid] = new_topic
+        print(f"Session {sid[:8]} monitoring: {new_topic}", flush=True)
+
+        with self.device_list_lock:
+            device_data = next(
+                (d for d in self.device_list.values() if d['topic'] == new_topic), None
+            )
+            if device_data:
+                cached = {
+                    'zone_config':        dict(device_data.get('zone_config', {})),
+                    'interference_zones': list(device_data.get('interference_zones', [])),
+                    'detection_zones':    list(device_data.get('detection_zones', [])),
+                    'stay_zones':         list(device_data.get('stay_zones', [])),
+                }
+
+        if device_data:
+            socketio.emit('zone_config',        {'topic': new_topic, 'payload': cached['zone_config']},        to=sid)
+            socketio.emit('interference_zones', {'topic': new_topic, 'payload': cached['interference_zones']}, to=sid)
+            socketio.emit('detection_zones',    {'topic': new_topic, 'payload': cached['detection_zones']},    to=sid)
+            socketio.emit('stay_zones',         {'topic': new_topic, 'payload': cached['stay_zones']},         to=sid)
+
+    def update_parameter(self, sid, param, value):
+        with session_topics_lock:
+            topic = session_topics.get(sid)
+        if not topic:
+            socketio.emit('command_error', {'error': 'No device selected'}, to=sid)
+            return
+
+        is_valid, error_msg = validate_parameter(param, value)
+        if not is_valid:
+            print(f"Parameter validation failed: {error_msg}", flush=True)
+            socketio.emit('command_error', {'error': error_msg}, to=sid)
+            return
+
+        with self.device_list_lock:
+            fname = next((n for n, d in self.device_list.items() if d['topic'] == topic), None)
+
+        # Legacy fallback: older firmware uses flat top-level attributes for Detection Area 1
+        # instead of the nested mmwave_detection_areas structure used by newer versions.
+        if fname and param == "mmwave_detection_areas" and isinstance(value, dict) and "area1" in value:
+            with self.device_list_lock:
+                use_nested = self.device_list.get(fname, {}).get('use_nested_area1', False)
+            if not use_nested:
+                try:
+                    z = value["area1"]
+                    legacy = {
+                        "mmWaveWidthMin":  int(z.get("width_min",  0)),
+                        "mmWaveWidthMax":  int(z.get("width_max",  0)),
+                        "mmWaveDepthMin":  int(z.get("depth_min",  0)),
+                        "mmWaveDepthMax":  int(z.get("depth_max",  0)),
+                        "mmWaveHeightMin": int(z.get("height_min", 0)),
+                        "mmWaveHeightMax": int(z.get("height_max", 0)),
+                    }
+                    self._client.publish(f"{topic}/set", json.dumps(legacy))
+                    socketio.emit('command_ack', {'param': param, 'status': 'sent_legacy'}, to=sid)
+                    return
+                except Exception as e:
+                    socketio.emit('command_error', {'error': f'Legacy mapping failed: {e}'}, to=sid)
+                    return
+
+        if isinstance(value, str) and value.lstrip('-').isnumeric():
+            value = int(value)
+        self._client.publish(f"{topic}/set", json.dumps({param: value}))
+        socketio.emit('command_ack', {'param': param, 'status': 'sent'}, to=sid)
+
+    def send_command(self, sid, cmd_action):
+        with session_topics_lock:
+            topic = session_topics.get(sid)
+        if not topic:
+            socketio.emit('command_error', {'error': 'No device selected'}, to=sid)
+            return
+        if not self.mqtt_connected:
+            socketio.emit('command_error', {'error': 'MQTT broker is not connected'}, to=sid)
             return
 
         try:
-            payload = json.loads(payload_str)
-        except json.JSONDecodeError:
+            cmd_int = int(cmd_action)
+        except (ValueError, TypeError):
+            socketio.emit('command_error', {'error': f'Invalid command: {cmd_action}'}, to=sid)
             return
 
-        # Skip non-dict payloads (e.g. bare ints from /set/paramName topics)
-        if not isinstance(payload, dict):
+        action_map = {
+            0: "reset_mmwave_module",
+            1: "set_interference",
+            2: "query_areas",
+            3: "clear_interference",
+            4: "reset_detection_area",
+            5: "clear_stay_areas",
+        }
+        cmd_string = action_map.get(cmd_int)
+        if cmd_string:
+            self._client.publish(
+                f"{topic}/set",
+                json.dumps({"mmwave_control_commands": {"controlID": cmd_string}})
+            )
+            socketio.emit('command_ack', {'command': cmd_string, 'status': 'sent'}, to=sid)
+        else:
+            socketio.emit('command_error', {'error': f'Unknown command: {cmd_action}'}, to=sid)
+
+    def force_sync(self, sid):
+        with session_topics_lock:
+            topic = session_topics.get(sid)
+        if not topic:
+            return  # No device selected yet — silent, expected on page load
+
+        if not self.mqtt_connected:
+            socketio.emit('command_error', {'error': 'MQTT broker is not connected'}, to=sid)
             return
 
-        # --- DEVICE DISCOVERY ---
-        # Isolated: discovery failures must not block state processing
+        with self.device_list_lock:
+            device_data = next(
+                (d for d in self.device_list.values() if d['topic'] == topic), None
+            )
+            if device_data:
+                cached = {
+                    'zone_config':        dict(device_data.get('zone_config', {})),
+                    'interference_zones': list(device_data.get('interference_zones', [])),
+                    'detection_zones':    list(device_data.get('detection_zones', [])),
+                    'stay_zones':         list(device_data.get('stay_zones', [])),
+                }
+
+        if device_data:
+            socketio.emit('zone_config',        {'topic': topic, 'payload': cached['zone_config']},        to=sid)
+            socketio.emit('interference_zones', {'topic': topic, 'payload': cached['interference_zones']}, to=sid)
+            socketio.emit('detection_zones',    {'topic': topic, 'payload': cached['detection_zones']},    to=sid)
+            socketio.emit('stay_zones',         {'topic': topic, 'payload': cached['stay_zones']},         to=sid)
+
+        # Request a fresh state dump and zone report from the switch
+        get_payload = {
+            "state": "", "occupancy": "", "illuminance": "",
+            "mmWaveDepthMax": "", "mmWaveDepthMin": "",
+            "mmWaveWidthMax": "", "mmWaveWidthMin": "",
+            "mmWaveHeightMax": "", "mmWaveHeightMin": "",
+            "mmWaveDetectSensitivity": "", "mmWaveDetectTrigger": "",
+            "mmWaveHoldTime": "", "mmWaveStayLife": "",
+            "mmWaveRoomSizePreset": "", "mmWaveTargetInfoReport": "",
+            "mmWaveVersion": "", "mmwaveControlWiredDevice": ""
+        }
+        self._client.publish(f"{topic}/get", json.dumps(get_payload))
+        self._client.publish(
+            f"{topic}/set",
+            json.dumps({"mmwave_control_commands": {"controlID": "query_areas"}})
+        )
+        print(f"Z2M force_sync sent to {topic}", flush=True)
+
+    # --- MQTT callbacks ---
+
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self.mqtt_connected = True
+            print("MQTT: connected to broker.", flush=True)
+            client.subscribe(f"{MQTT_BASE_TOPIC}/#")
+            socketio.emit('mqtt_status', {'connected': True})
+        else:
+            self.mqtt_connected = False
+            print(f"MQTT: connection failed (rc={rc}).", flush=True)
+            socketio.emit('mqtt_status', {'connected': False, 'error': f'Connection code: {rc}'})
+
+    def _on_disconnect(self, client, userdata, rc):
+        self.mqtt_connected = False
+        print(f"MQTT: disconnected from broker (rc={rc}).", flush=True)
+        socketio.emit('mqtt_status', {'connected': False, 'error': 'Broker disconnected'})
+
+    def _on_message(self, client, userdata, msg):
         try:
-            if topic.startswith(MQTT_BASE_TOPIC):
-                if "mmWaveVersion" in payload:
+            topic       = msg.topic
+            payload_str = msg.payload.decode().strip()
+            if not payload_str:
+                return
+            try:
+                payload = json.loads(payload_str)
+            except json.JSONDecodeError:
+                return
+            if not isinstance(payload, dict):
+                return
+
+            # --- Device discovery ---
+            try:
+                if topic.startswith(MQTT_BASE_TOPIC) and "mmWaveVersion" in payload:
                     parts = topic.split('/')
                     if len(parts) >= 2:
-                        friendly_name = parts[1]
-
-                        with device_list_lock:
-                            is_new = friendly_name not in device_list
+                        fname = parts[1]
+                        with self.device_list_lock:
+                            is_new = fname not in self.device_list
                             if is_new:
-                                print(f"Discovered Inovelli mmWave Switch: {friendly_name}", flush=True)
-                                device_list[friendly_name] = {
-                                    'friendly_name': friendly_name,
-                                    'topic': f"{MQTT_BASE_TOPIC}/{friendly_name}",
+                                print(f"Z2M: discovered {fname}", flush=True)
+                                self.device_list[fname] = {
+                                    'friendly_name':      fname,
+                                    'topic':              f"{MQTT_BASE_TOPIC}/{fname}",
                                     'interference_zones': [],
-                                    'detection_zones': [],
-                                    'stay_zones': [],
-                                    'use_nested_area1': False,
+                                    'detection_zones':    [],
+                                    'stay_zones':         [],
+                                    'use_nested_area1':   False,
                                     'zone_config': {
                                         "x_min": -100, "x_max": 100,
-                                        "y_min": 0, "y_max": 600,
-                                        "z_min": -300, "z_max": 300
+                                        "y_min": 0,    "y_max": 600,
+                                        "z_min": -300, "z_max": 300,
                                     },
                                     'last_update': 0,
-                                    'last_seen': time.time()
+                                    'last_seen':   time.time(),
                                 }
                             else:
-                                device_list[friendly_name]['last_seen'] = time.time()
-
+                                self.device_list[fname]['last_seen'] = time.time()
                         if is_new:
-                            socketio.emit('device_list', get_device_list_snapshot())
+                            socketio.emit('device_list', self.get_device_list_snapshot())
+            except Exception as e:
+                print(f"Z2M: device discovery error for {topic}: {e}", flush=True)
+
+            # --- Identify device ---
+            with self.device_list_lock:
+                fname = next(
+                    (n for n, d in self.device_list.items() if topic.startswith(d['topic'])),
+                    None
+                )
+                if not fname:
+                    return
+                device_topic = self.device_list[fname]['topic']
+
+            # --- Raw ZCL byte packets (cluster 0xFC32) ---
+            is_raw = (payload.get("0") == 29 and payload.get("1") == 47 and payload.get("2") == 18)
+            if is_raw:
+                cmd_id = payload.get("4")
+                if cmd_id == 1:
+                    try:
+                        self._process_target_data(payload, fname, device_topic)
+                    except Exception as e:
+                        print(f"Z2M: target data error: {e}", flush=True)
+                elif cmd_id in [2, 3, 4]:
+                    try:
+                        self._process_zone_report(payload, cmd_id, fname, device_topic)
+                    except Exception as e:
+                        print(f"Z2M: zone report error (cmd={cmd_id}): {e}", flush=True)
+
+            # --- Standard Z2M state update ---
+            try:
+                self._process_state_update(payload, fname, device_topic)
+            except Exception as e:
+                print(f"Z2M: state update error for {fname}: {e}", flush=True)
+
         except Exception as e:
-            print(f"Warning: Device discovery failed for {topic}: {e}", flush=True)
+            print(f"Z2M: unhandled error on {msg.topic}: {e}", flush=True)
+            traceback.print_exc()
 
-        # --- IDENTIFY DEVICE ---
-        with device_list_lock:
-            fname = next((name for name, data in device_list.items()
-                          if topic.startswith(data['topic'])), None)
-            if not fname:
-                return
-            device_topic = device_list[fname]['topic']
-
-        # --- PROCESS RAW BYTES (ZCL Cluster 0xFC32) ---
-        is_raw_packet = (payload.get("0") == 29 and
-                         payload.get("1") == 47 and
-                         payload.get("2") == 18)
-
-        if is_raw_packet:
-            cmd_id = payload.get("4")
-
-            # --- 0x01: Target Info Reporting ---
-            if cmd_id == 1:
-                try:
-                    _process_target_data(payload, fname, device_topic)
-                except Exception as e:
-                    print(f"Warning: Target data processing failed: {e}", flush=True)
-
-            # --- 0x02/0x03/0x04: Zone Area Reports ---
-            elif cmd_id in [2, 3, 4]:
-                try:
-                    _process_zone_report(payload, cmd_id, fname, device_topic)
-                except Exception as e:
-                    print(f"Warning: Zone report (cmd={cmd_id}) processing failed: {e}", flush=True)
-
-        # --- STANDARD STATE UPDATE ---
-        # Isolated: config processing failures must not block other messages
+    def _parse_signed_16(self, payload, idx):
         try:
-            _process_state_update(payload, fname, device_topic)
-        except Exception as e:
-            print(f"Warning: State update failed for {fname}: {e}", flush=True)
+            low  = int(payload.get(str(idx))     or 0)
+            high = int(payload.get(str(idx + 1)) or 0)
+            return int.from_bytes([low, high], byteorder='little', signed=True)
+        except (ValueError, TypeError, OverflowError):
+            return 0
 
-    except Exception as e:
-        print(f"Error processing message on {msg.topic}: {e}", flush=True)
-        traceback.print_exc()
+    def _process_target_data(self, payload, fname, device_topic):
+        current_time = time.time()
+        with self.device_list_lock:
+            last_update = self.device_list.get(fname, {}).get('last_update', 0)
+        if (current_time - last_update) < 0.1:
+            return  # Throttle to ~10 Hz max
+        with self.device_list_lock:
+            if fname in self.device_list:
+                self.device_list[fname]['last_update'] = current_time
 
-
-def _process_target_data(payload, fname, device_topic):
-    """Process cmd_id=1 target info reporting packets."""
-    current_time = time.time()
-    with device_list_lock:
-        last_update = device_list.get(fname, {}).get('last_update', 0)
-
-    if (current_time - last_update) < 0.1:
-        return  # Throttle
-
-    with device_list_lock:
-        if fname in device_list:
-            device_list[fname]['last_update'] = current_time
-
-    seq_num = payload.get("3")
-    num_targets = safe_int(payload.get("5"), 0)
-    if num_targets < 0 or num_targets > 10:
-        return  # Sanity bound
-
-    targets = []
-    offset = 6
-
-    for _ in range(num_targets):
-        if str(offset + 8) not in payload:
-            break
-        targets.append({
-            "id": safe_int(payload.get(str(offset + 8)), 0),
-            "x": parse_signed_16(payload, offset),
-            "y": parse_signed_16(payload, offset + 2),
-            "z": parse_signed_16(payload, offset + 4),
-            "dop": parse_signed_16(payload, offset + 6)
-        })
-        offset += 9
-
-    emit_to_topic_subscribers(
-        'new_data',
-        {'topic': device_topic, 'payload': {"seq": seq_num, "targets": targets}},
-        device_topic
-    )
-
-
-def _process_zone_report(payload, cmd_id, fname, device_topic):
-    """Process cmd_id 2/3/4 zone area report packets."""
-    zones = []
-    offset = 6
-    num_zones = safe_int(payload.get("5"), 0)
-    if num_zones < 0 or num_zones > 10:
-        return  # Sanity bound
-
-    for _ in range(num_zones):
-        if str(offset + 11) not in payload:
-            break
-
-        x_min = parse_signed_16(payload, offset)
-        x_max = parse_signed_16(payload, offset + 2)
-        y_min = parse_signed_16(payload, offset + 4)
-        y_max = parse_signed_16(payload, offset + 6)
-        z_min = parse_signed_16(payload, offset + 8)
-        z_max = parse_signed_16(payload, offset + 10)
-
-        if (x_max != 0 or x_min != 0 or y_max != 0 or y_min != 0):
-            zones.append({
-                "x_min": x_min, "x_max": x_max,
-                "y_min": y_min, "y_max": y_max,
-                "z_min": z_min, "z_max": z_max
-            })
-
-        offset += 12
-
-    event_map = {
-        2: ('interference_zones', 'Interference'),
-        3: ('detection_zones', 'Detection'),
-        4: ('stay_zones', 'Stay')
-    }
-    event_name, zone_label = event_map[cmd_id]
-
-    with device_list_lock:
-        if fname in device_list:
-            device_list[fname][event_name] = zones
-
-    emit_to_topic_subscribers(
-        event_name,
-        {'topic': device_topic, 'payload': zones},
-        device_topic
-    )
-    print(f"{zone_label} Zones Updated: {zones}", flush=True)
-
-
-def _process_state_update(payload, fname, device_topic):
-    """Process standard (non-raw) Z2M state updates."""
-    config_payload = {k: v for k, v in payload.items() if not k.isdigit()}
-
-    if not config_payload:
-        return
-
-    emit_to_topic_subscribers(
-        'device_config',
-        {'topic': device_topic, 'payload': config_payload},
-        device_topic
-    )
-
-    zone_snapshot = None
-    needs_emit = False
-
-    with device_list_lock:
-        if fname not in device_list:
+        num_targets = safe_int(payload.get("5"), 0)
+        if not (0 <= num_targets <= 10):
             return
 
-        # Check nested mode for Zone 1
-        if "mmwave_detection_areas" in config_payload:
-            areas = config_payload["mmwave_detection_areas"]
-            has_data = False
-            if isinstance(areas, dict):
-                a1 = areas.get("area1")
-                if isinstance(a1, dict):
-                    for val in a1.values():
-                        if isinstance(val, (int, float)) and val != 0:
-                            has_data = True
-                            break
-            device_list[fname]['use_nested_area1'] = has_data
+        targets = []
+        offset  = 6
+        for _ in range(num_targets):
+            if str(offset + 8) not in payload:
+                break
+            targets.append({
+                "id":  safe_int(payload.get(str(offset + 8)), 0),
+                "x":   self._parse_signed_16(payload, offset),
+                "y":   self._parse_signed_16(payload, offset + 2),
+                "z":   self._parse_signed_16(payload, offset + 4),
+                "dop": self._parse_signed_16(payload, offset + 6),
+            })
+            offset += 9
 
-        # Update standard global zone
-        current_zone = device_list[fname]['zone_config']
-
-        field_map = {
-            "mmWaveWidthMin": "x_min", "mmWaveWidthMax": "x_max",
-            "mmWaveDepthMin": "y_min", "mmWaveDepthMax": "y_max",
-            "mmWaveHeightMin": "z_min", "mmWaveHeightMax": "z_max"
-        }
-        for mqtt_key, zone_key in field_map.items():
-            if mqtt_key in config_payload:
-                current_zone[zone_key] = safe_int(config_payload[mqtt_key])
-                needs_emit = True
-
-        if needs_emit:
-            device_list[fname]['zone_config'] = current_zone
-            zone_snapshot = dict(current_zone)
-
-    if needs_emit and zone_snapshot:
         emit_to_topic_subscribers(
-            'zone_config',
-            {'topic': device_topic, 'payload': zone_snapshot},
+            'new_data',
+            {'topic': device_topic, 'payload': {"seq": payload.get("3"), "targets": targets}},
             device_topic
         )
 
+    def _process_zone_report(self, payload, cmd_id, fname, device_topic):
+        num_zones = safe_int(payload.get("5"), 0)
+        if not (0 <= num_zones <= 10):
+            return
 
-# --- MQTT CLIENT SETUP ---
-mqtt_client = mqtt.Client()
-if MQTT_USERNAME and MQTT_PASSWORD:
-    mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        zones  = []
+        offset = 6
+        for _ in range(num_zones):
+            if str(offset + 11) not in payload:
+                break
+            x_min = self._parse_signed_16(payload, offset)
+            x_max = self._parse_signed_16(payload, offset + 2)
+            y_min = self._parse_signed_16(payload, offset + 4)
+            y_max = self._parse_signed_16(payload, offset + 6)
+            z_min = self._parse_signed_16(payload, offset + 8)
+            z_max = self._parse_signed_16(payload, offset + 10)
+            if x_max != 0 or x_min != 0 or y_max != 0 or y_min != 0:
+                zones.append({
+                    "x_min": x_min, "x_max": x_max,
+                    "y_min": y_min, "y_max": y_max,
+                    "z_min": z_min, "z_max": z_max,
+                })
+            offset += 12
 
-mqtt_client.on_connect = on_connect
-mqtt_client.on_disconnect = on_disconnect
-mqtt_client.on_message = on_message
+        event_map = {
+            2: ('interference_zones', 'Interference'),
+            3: ('detection_zones',    'Detection'),
+            4: ('stay_zones',         'Stay'),
+        }
+        event_name, zone_label = event_map[cmd_id]
 
-try:
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    mqtt_client.loop_start()
-except Exception as e:
-    print(f"MQTT Connection Failed: {e}", flush=True)
+        with self.device_list_lock:
+            if fname in self.device_list:
+                self.device_list[fname][event_name] = zones
+
+        emit_to_topic_subscribers(event_name, {'topic': device_topic, 'payload': zones}, device_topic)
+        print(f"Z2M: {zone_label} zones updated ({len(zones)} active).", flush=True)
+
+    def _process_state_update(self, payload, fname, device_topic):
+        config_payload = {k: v for k, v in payload.items() if not k.isdigit()}
+        if not config_payload:
+            return
+
+        emit_to_topic_subscribers('device_config', {'topic': device_topic, 'payload': config_payload}, device_topic)
+
+        zone_snapshot = None
+        needs_emit    = False
+
+        with self.device_list_lock:
+            if fname not in self.device_list:
+                return
+
+            # Detect whether this firmware uses nested area1 or flat top-level attributes
+            if "mmwave_detection_areas" in config_payload:
+                areas    = config_payload["mmwave_detection_areas"]
+                has_data = False
+                if isinstance(areas, dict):
+                    a1 = areas.get("area1")
+                    if isinstance(a1, dict):
+                        has_data = any(
+                            isinstance(v, (int, float)) and v != 0
+                            for v in a1.values()
+                        )
+                self.device_list[fname]['use_nested_area1'] = has_data
+
+            current_zone = self.device_list[fname]['zone_config']
+            field_map = {
+                "mmWaveWidthMin":  "x_min", "mmWaveWidthMax":  "x_max",
+                "mmWaveDepthMin":  "y_min", "mmWaveDepthMax":  "y_max",
+                "mmWaveHeightMin": "z_min", "mmWaveHeightMax": "z_max",
+            }
+            for mqtt_key, zone_key in field_map.items():
+                if mqtt_key in config_payload:
+                    current_zone[zone_key] = safe_int(config_payload[mqtt_key])
+                    needs_emit = True
+
+            if needs_emit:
+                self.device_list[fname]['zone_config'] = current_zone
+                zone_snapshot = dict(current_zone)
+
+        if needs_emit and zone_snapshot:
+            emit_to_topic_subscribers('zone_config', {'topic': device_topic, 'payload': zone_snapshot}, device_topic)
+
+    def _cleanup_loop(self):
+        """Remove devices not seen for over 1 hour."""
+        while True:
+            time.sleep(60)
+            current_time = time.time()
+            with self.device_list_lock:
+                stale = [k for k, v in self.device_list.items()
+                         if (current_time - v.get('last_seen', 0)) > 3600]
+                for key in stale:
+                    del self.device_list[key]
+            if stale:
+                socketio.emit('device_list', self.get_device_list_snapshot())
 
 
-# --- WEBSOCKET HANDLERS ---
+# ===========================================================================
+# ZHA DRIVER
+# Thin wrapper around ZHAClient. Exposes the same interface as Z2MDriver.
+# ===========================================================================
+
+class ZHADriver:
+
+    def __init__(self):
+        from zha_client import ZHAClient
+        self._zha = ZHAClient(HA_URL, HA_TOKEN, socketio, debug=DEBUG)
+
+    def start(self):
+        self._zha.start()
+
+    def get_device_list_snapshot(self):
+        # Return copies so callers cannot mutate internal state
+        return [dict(d) for d in self._zha.device_list.values()]
+
+    def set_device(self, sid, new_topic):
+        with session_topics_lock:
+            session_topics[sid] = new_topic
+        ieee = self._topic_to_ieee(new_topic)
+        if ieee:
+            self._zha.set_device(ieee, new_topic)
+        else:
+            print(f"ZHA: unknown topic {new_topic}", flush=True)
+
+    def update_parameter(self, sid, param, value):
+        with session_topics_lock:
+            topic = session_topics.get(sid)
+        if not topic:
+            socketio.emit('command_error', {'error': 'No device selected'}, to=sid)
+            return
+        is_valid, error_msg = validate_parameter(param, value)
+        if not is_valid:
+            socketio.emit('command_error', {'error': error_msg}, to=sid)
+            return
+        self._zha.update_parameter(param, value)
+        socketio.emit('command_ack', {'param': param, 'status': 'sent'}, to=sid)
+
+    def send_command(self, sid, cmd_action):
+        with session_topics_lock:
+            topic = session_topics.get(sid)
+        if not topic:
+            socketio.emit('command_error', {'error': 'No device selected'}, to=sid)
+            return
+        try:
+            self._zha.send_control_command(int(cmd_action))
+            socketio.emit('command_ack', {'command': cmd_action, 'status': 'sent'}, to=sid)
+        except Exception as e:
+            socketio.emit('command_error', {'error': str(e)}, to=sid)
+
+    def force_sync(self, sid):
+        with session_topics_lock:
+            topic = session_topics.get(sid)
+        if not topic:
+            return  # No device selected yet — silent, expected on page load
+        ieee = self._topic_to_ieee(topic)
+        if not ieee:
+            socketio.emit('command_error', {'error': 'Device not found'}, to=sid)
+            return
+        self._zha.force_sync(sid=sid)
+
+    def _topic_to_ieee(self, topic: str):
+        """Reverse-lookup IEEE address from a zha/<ieee> topic string."""
+        for ieee, dev in self._zha.device_list.items():
+            if dev.get('topic') == topic:
+                return ieee
+        # Direct parse as fallback
+        if topic.startswith("zha/"):
+            return topic[4:]
+        return None
+
+
+# ===========================================================================
+# Debug-aware socket.io emit wrapper
+#
+# Intercepts every socketio.emit call and prints a truncated preview when
+# debug=true. Wrapping at this level means all emits from both drivers are
+# covered without modifying individual call sites.
+# ===========================================================================
+
+_original_socketio_emit = socketio.emit
+
+def _debug_emit(event, data=None, **kwargs):
+    if DEBUG:
+        try:
+            preview = json.dumps(data, default=str)
+            if len(preview) > 300:
+                preview = preview[:300] + "..."
+        except Exception:
+            preview = str(data)[:300]
+        print(f"[DEBUG] emit → {event}: {preview}", flush=True)
+    return _original_socketio_emit(event, data, **kwargs)
+
+socketio.emit = _debug_emit
+
+
+# ===========================================================================
+# Driver instantiation
+# ===========================================================================
+
+if ZIGBEE_STACK == 'zha':
+    driver = ZHADriver()
+else:
+    if ZIGBEE_STACK != 'z2m':
+        print(f"Warning: unknown zigbee_stack '{ZIGBEE_STACK}', defaulting to z2m.", flush=True)
+    driver = Z2MDriver()
+
+driver.start()
+
+
+# ===========================================================================
+# Flask-SocketIO handlers — stack-agnostic
+# ===========================================================================
 
 @socketio.on('connect')
 def handle_connect():
-    """Send MQTT status and device list on new client connection."""
-    emit('mqtt_status', {'connected': mqtt_connected})
-    emit('device_list', get_device_list_snapshot())
+    # For ZHA we send optimistic connected=True; ZHAClient will correct it
+    # via a mqtt_status emit if the WebSocket is actually down.
+    is_connected = True if ZIGBEE_STACK == 'zha' else driver.mqtt_connected
+    emit('mqtt_status', {'connected': is_connected})
+    emit('device_list', driver.get_device_list_snapshot())
+    emit('stack_info',  {'stack': ZIGBEE_STACK})
 
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    sid = request.sid
     with session_topics_lock:
-        session_topics.pop(sid, None)
+        session_topics.pop(request.sid, None)
 
 
 @socketio.on('request_devices')
 def handle_request_devices():
-    emit('device_list', get_device_list_snapshot())
+    emit('device_list', driver.get_device_list_snapshot())
 
 
 @socketio.on('change_device')
 def handle_change_device(new_topic):
-    sid = request.sid
-    with session_topics_lock:
-        session_topics[sid] = new_topic
-    print(f"Session {sid[:8]} now monitoring: {new_topic}", flush=True)
-
-    with device_list_lock:
-        device_data = next((data for data in device_list.values()
-                            if data['topic'] == new_topic), None)
-        if device_data:
-            cached = {
-                'zone_config': dict(device_data.get('zone_config', {})),
-                'interference_zones': list(device_data.get('interference_zones', [])),
-                'detection_zones': list(device_data.get('detection_zones', [])),
-                'stay_zones': list(device_data.get('stay_zones', [])),
-            }
-
-    if device_data:
-        emit('zone_config', {'topic': new_topic, 'payload': cached['zone_config']})
-        emit('interference_zones', {'topic': new_topic, 'payload': cached['interference_zones']})
-        emit('detection_zones', {'topic': new_topic, 'payload': cached['detection_zones']})
-        emit('stay_zones', {'topic': new_topic, 'payload': cached['stay_zones']})
+    driver.set_device(request.sid, new_topic)
 
 
 @socketio.on('update_parameter')
 def handle_update_parameter(data):
-    sid = request.sid
-    with session_topics_lock:
-        topic = session_topics.get(sid)
-    if not topic:
-        emit('command_error', {'error': 'No device selected'})
-        return
-
-    param = data.get('param')
-    value = data.get('value')
-
-    # --- FIX #10: Validate before publishing ---
-    is_valid, error_msg = validate_parameter(param, value)
-    if not is_valid:
-        print(f"Parameter validation failed: {error_msg}", flush=True)
-        emit('command_error', {'error': error_msg})
-        return
-
-    # Identify device for legacy fallback
-    with device_list_lock:
-        fname = next((name for name, d in device_list.items()
-                       if d['topic'] == topic), None)
-
-    # Fallback Logic: Intercept writes to mmwave_detection_areas:area1
-    if fname and param == "mmwave_detection_areas" and isinstance(value, dict) and "area1" in value:
-        with device_list_lock:
-            use_nested = device_list.get(fname, {}).get('use_nested_area1', False)
-
-        if not use_nested:
-            try:
-                z_data = value["area1"]
-                legacy_payload = {
-                    "mmWaveWidthMin": int(z_data.get("width_min", 0)),
-                    "mmWaveWidthMax": int(z_data.get("width_max", 0)),
-                    "mmWaveDepthMin": int(z_data.get("depth_min", 0)),
-                    "mmWaveDepthMax": int(z_data.get("depth_max", 0)),
-                    "mmWaveHeightMin": int(z_data.get("height_min", 0)),
-                    "mmWaveHeightMax": int(z_data.get("height_max", 0))
-                }
-                mqtt_client.publish(f"{topic}/set", json.dumps(legacy_payload))
-                print(f"Mapped Area 1 write to Top Level params for {fname}", flush=True)
-                emit('command_ack', {'param': param, 'status': 'sent_legacy'})
-                return
-            except Exception as e:
-                print(f"Error mapping legacy zone: {e}", flush=True)
-                emit('command_error', {'error': f'Legacy mapping failed: {e}'})
-                return
-
-    # Standard publish
-    if isinstance(value, str) and value.lstrip('-').isnumeric():
-        value = int(value)
-
-    control_payload = {param: value}
-    mqtt_client.publish(f"{topic}/set", json.dumps(control_payload))
-    emit('command_ack', {'param': param, 'status': 'sent'})
-
-
-@socketio.on('force_sync')
-def handle_force_sync():
-    sid = request.sid
-    with session_topics_lock:
-        topic = session_topics.get(sid)
-    if not topic:
-        emit('command_error', {'error': 'No device selected'})
-        return
-
-    if not mqtt_connected:
-        emit('command_error', {'error': 'MQTT broker is not connected'})
-        return
-
-    # 1. Emit cached data
-    with device_list_lock:
-        device_data = next((data for data in device_list.values()
-                            if data['topic'] == topic), None)
-        if device_data:
-            cached = {
-                'zone_config': dict(device_data.get('zone_config', {})),
-                'interference_zones': list(device_data.get('interference_zones', [])),
-                'detection_zones': list(device_data.get('detection_zones', [])),
-                'stay_zones': list(device_data.get('stay_zones', [])),
-            }
-
-    if device_data:
-        emit('zone_config', {'topic': topic, 'payload': cached['zone_config']})
-        emit('interference_zones', {'topic': topic, 'payload': cached['interference_zones']})
-        emit('detection_zones', {'topic': topic, 'payload': cached['detection_zones']})
-        emit('stay_zones', {'topic': topic, 'payload': cached['stay_zones']})
-
-    # 2. Trigger Z2M read
-    payload = {
-        "state": "", "occupancy": "", "illuminance": "",
-        "mmWaveDepthMax": "", "mmWaveDepthMin": "",
-        "mmWaveWidthMax": "", "mmWaveWidthMin": "",
-        "mmWaveHeightMax": "", "mmWaveHeightMin": "",
-        "mmWaveDetectSensitivity": "", "mmWaveDetectTrigger": "",
-        "mmWaveHoldTime": "", "mmWaveStayLife": "",
-        "mmWaveRoomSizePreset": "", "mmWaveTargetInfoReport": "",
-        "mmWaveVersion": "", "mmwaveControlWiredDevice": ""
-    }
-    mqtt_client.publish(f"{topic}/get", json.dumps(payload))
-
-    # 3. Trigger mmWave Module Report
-    cmd_payload = {"mmwave_control_commands": {"controlID": "query_areas"}}
-    mqtt_client.publish(f"{topic}/set", json.dumps(cmd_payload))
-    print(f"Force Sync sent to {topic}", flush=True)
+    driver.update_parameter(request.sid, data.get('param'), data.get('value'))
 
 
 @socketio.on('send_command')
 def handle_command(cmd_action):
-    sid = request.sid
-    with session_topics_lock:
-        topic = session_topics.get(sid)
-    if not topic:
-        emit('command_error', {'error': 'No device selected'})
-        return
-
-    if not mqtt_connected:
-        emit('command_error', {'error': 'MQTT broker is not connected'})
-        return
-
-    try:
-        cmd_int = int(cmd_action)
-    except (ValueError, TypeError):
-        emit('command_error', {'error': f'Invalid command: {cmd_action}'})
-        return
-
-    action_map = {
-        0: "reset_mmwave_module",
-        1: "set_interference",
-        2: "query_areas",
-        3: "clear_interference",
-        4: "reset_detection_area",
-        5: "clear_stay_areas"
-    }
-    cmd_string = action_map.get(cmd_int)
-    if cmd_string:
-        mqtt_client.publish(
-            f"{topic}/set",
-            json.dumps({"mmwave_control_commands": {"controlID": cmd_string}})
-        )
-        emit('command_ack', {'command': cmd_string, 'status': 'sent'})
-    else:
-        emit('command_error', {'error': f'Unknown command: {cmd_action}'})
+    driver.send_command(request.sid, cmd_action)
 
 
-def cleanup_stale_devices():
-    """Remove devices not seen for over 1 hour."""
-    while True:
-        time.sleep(60)
-        current_time = time.time()
-        with device_list_lock:
-            stale_keys = [k for k, v in device_list.items()
-                          if (current_time - v.get('last_seen', 0)) > 3600]
-            for key in stale_keys:
-                del device_list[key]
-        if stale_keys:
-            socketio.emit('device_list', get_device_list_snapshot())
+@socketio.on('force_sync')
+def handle_force_sync():
+    driver.force_sync(request.sid)
 
 
-cleanup_thread = threading.Thread(target=cleanup_stale_devices, daemon=True)
-cleanup_thread.start()
-
+# ===========================================================================
+# Flask route
+# ===========================================================================
 
 @app.route('/')
 def index():
-    return render_template('index.html',
-                           ingress_path=request.headers.get('X-Ingress-Path', ''))
+    return render_template(
+        'index.html',
+        ingress_path=request.headers.get('X-Ingress-Path', ''),
+        zigbee_stack=ZIGBEE_STACK,
+    )
 
 
 if __name__ == '__main__':
