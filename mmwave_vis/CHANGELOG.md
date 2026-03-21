@@ -1,6 +1,17 @@
 # Changelog
 
 
+## [3.1.1] - 2026-03-21
+
+### Fixed
+- **Device names containing `/` could not be saved (Z2M):** If a Z2M friendly name included a forward slash (e.g. `Switch w/ mmWave`), the MQTT topic parser split the name on `/` and discarded everything after it, causing the device to be discovered under the wrong name. Any attempt to save settings would publish to the wrong MQTT topic and silently fail. Fixed by joining all topic segments after the base with `/` (`'/'.join(parts[1:])`) to preserve the full name.
+
+### Added
+- **38 topic-parsing tests:** `tests/test_z2m_topic_parsing.py` verifies the friendly-name extraction round-trips correctly for forward slashes, `&`, `+`, `#`, `%`, brackets, quotes, emoji, CJK, Arabic, and realistic combinations like `"Switch w/ mmWave & Dimmer"`.
+
+### Changed
+- Bumped version to 3.1.1.
+
 ## [3.1.0] - 2026-03-20
 
 ### Fixed
