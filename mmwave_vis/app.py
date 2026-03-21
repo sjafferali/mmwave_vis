@@ -341,7 +341,7 @@ class Z2MDriver:
                 if topic.startswith(MQTT_BASE_TOPIC) and "mmWaveVersion" in payload:
                     parts = topic.split('/')
                     if len(parts) >= 2:
-                        fname = parts[1]
+                        fname = '/'.join(parts[1:])
                         with self.device_list_lock:
                             is_new = fname not in self.device_list
                             if is_new:
