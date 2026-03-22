@@ -338,7 +338,15 @@ class Z2MDriver:
 
             # --- Device discovery ---
             try:
-                if topic.startswith(MQTT_BASE_TOPIC) and "mmWaveVersion" in payload:
+                # Z2M echoes the full device state (including mmWaveVersion)
+                # on …/get and …/set response topics.  Exclude those so we
+                # only discover devices from their base topic publish.
+                if (
+                    topic.startswith(MQTT_BASE_TOPIC)
+                    and "mmWaveVersion" in payload
+                    and not topic.endswith("/get")
+                    and not topic.endswith("/set")
+                ):
                     parts = topic.split('/')
                     if len(parts) >= 2:
                         fname = '/'.join(parts[1:])

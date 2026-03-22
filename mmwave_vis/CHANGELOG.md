@@ -1,6 +1,17 @@
 # Changelog
 
 
+## [3.1.2] - 2026-03-22
+
+### Fixed
+- **Phantom `/get` and `/set` devices in device list (Z2M):** When Z2M echoes back the full device state on `…/get` or `…/set` response topics, the discovery logic treated them as new devices, creating phantom entries like `kitchen/get` alongside the real `kitchen` device. Fixed by filtering out any topic ending with `/get` or `/set` before device discovery.
+
+### Added
+- **38 discovery-filter tests:** `tests/test_z2m_discovery_filter.py` verifies `/get` and `/set` suffix rejection, cascading `/get/get` chains, case sensitivity, device names containing "get"/"set" as substrings (e.g. "gadget", "sunset"), bridge/system topics, custom base topics, and missing `mmWaveVersion` payloads.
+
+### Changed
+- Bumped version to 3.1.2.
+
 ## [3.1.1] - 2026-03-21
 
 ### Fixed
