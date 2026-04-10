@@ -104,9 +104,35 @@ Before starting the add-on, go to the **Configuration** tab and connect it to yo
 
 Please open an issue on GitHub if you encounter any bugs.
 
+## Docker
+
+A pre-built Docker image is available on Docker Hub. This lets you run the visualizer standalone, outside of Home Assistant.
+
+### Docker Compose
+
+```yaml
+services:
+  mmwave_vis:
+    image: sjafferali/mmwave_vis:latest
+    ports:
+      - "5000:5000"
+    environment:
+      - MQTT_BROKER=localhost
+      - MQTT_PORT=1883
+      - MQTT_USERNAME=
+      - MQTT_PASSWORD=
+      - MQTT_BASE_TOPIC=zigbee2mqtt
+      - ZIGBEE_STACK=z2m
+      - DEBUG=false
+      - PORT=5000
+    restart: unless-stopped
+```
+
+The image is automatically built and pushed to Docker Hub on every push to `main`. It supports `linux/amd64` and `linux/arm64`.
+
 ## Requirements
 
-- Home Assistant OS or Supervised
+- Home Assistant OS or Supervised (for the add-on install)
 - [Zigbee2MQTT](https://www.zigbee2mqtt.io/) v2.8.0 or higher (ZHA is not supported)
 - At least one Inovelli mmWave Smart Switch
 
