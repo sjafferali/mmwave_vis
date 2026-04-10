@@ -8,7 +8,9 @@ COPY mmwave_vis/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY mmwave_vis/ .
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh && mkdir -p /data
 
 EXPOSE 5000
 
-CMD ["python", "app.py"]
+CMD ["./entrypoint.sh"]
