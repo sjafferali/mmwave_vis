@@ -34,7 +34,7 @@ logging.getLogger('werkzeug').setLevel(logging.ERROR)
 # ---------------------------------------------------------------------------
 # Load Home Assistant addon configuration
 # ---------------------------------------------------------------------------
-CONFIG_PATH = '/data/options.json'
+CONFIG_PATH = os.environ.get('MMWAVE_VIS_CONFIG_PATH', '/data/options.json')
 
 try:
     with open(CONFIG_PATH) as f:
@@ -713,4 +713,5 @@ def index():
 
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+    port = int(os.environ.get('PORT', 5000))
+    socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
